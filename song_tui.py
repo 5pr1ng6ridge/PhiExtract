@@ -15,7 +15,8 @@ from textual.widgets import Button, Checkbox, Footer, Header, Input, Label, Opti
 from textual.widgets.option_list import Option
 
 from extract_songs import (CATALOG, Catalog, DifficultyInfo, ExtractionError, SongInfo,
-                           available_difficulties, default_cli, extract_difficulties)
+                           available_difficulties, default_cli, extract_difficulties,
+                           read_song_meta, song_metadata)
 
 DIFFICULTIES = ("EZ", "HD", "IN", "AT", "Legacy", "EZ_Error", "HD_Error", "IN_Error")
 
@@ -77,6 +78,7 @@ class SongTUI(App):
         self.cli = cli
         self.current_apk: Path | None = None
         self.songs: dict = {}
+        self.meta: dict = {}
         self.previous_songs: dict | None = None
         self.added_songs: set[str] = set()
         self.removed_songs: set[str] = set()
@@ -104,7 +106,6 @@ class SongTUI(App):
                 yield OptionList(id="song-list")
             with VerticalScroll(id="right"):
                 yield Static("歌曲 / 选择难度", classes="section-title", id="song-title")
-                yield Static("每个难度独立目录、独立 info.txt；勾选后按需导出。")
                 for diff in DIFFICULTIES:
                     with Horizontal(id=f"row_{diff}", classes="difficulty"):
                         yield Checkbox(diff, id=f"check_{diff}")
@@ -145,6 +146,7 @@ class SongTUI(App):
         try:
             with zipfile.ZipFile(path) as archive:
                 songs = Catalog(json.loads(archive.read(CATALOG))).songs(archive)
+                meta = read_song_meta(archive, sorted(songs))
             if not songs:
                 raise ExtractionError("APK contains no songs")
         except (OSError, ValueError, KeyError, IndexError, zipfile.BadZipFile, ExtractionError) as exc:
@@ -156,9 +158,11 @@ class SongTUI(App):
         self.added_songs = set(songs).difference(previous) if previous is not None else set()
         self.removed_songs = set(previous).difference(songs) if previous is not None else set()
         self.current_apk, self.songs = path, songs
+        self.meta = meta
         self.song = None  # Force the details panel to refresh even if the same song remains selected.
         self._log(f"已加载 {path.name}: {len(songs)} 首曲目；"
-                  f"新增 {len(self.added_songs)}，移除 {len(self.removed_songs)}")
+                  f"新增 {len(self.added_songs)}，移除 {len(self.removed_songs)}；"
+                  f"自带元数据 {len(meta)} 首")
         self.refresh_search()
 
     def refresh_search(self) -> None:
@@ -200,14 +204,14 @@ class SongTUI(App):
                          if self.previous_songs is not None and song in self.previous_songs else set())
         new_available = (set(available_difficulties(self.songs[song])) if present else set())
         self.query_one("#export", Button).disabled = self.exporting or not present
-        title = f"{song}  ·  {', '.join(available)}"
+        info, per_diff = song_metadata(self.meta.get(song), song, DIFFICULTIES)
+        title = f"{song}  ·  {', '.join(per_diff[d].level for d in available)}"
         if not present:
             title += "  [已移除，不能从当前 APK 导出]"
         self.query_one("#song-title", Static).update(title)
-        parts = song.rsplit(".", 2)
-        self.query_one("#name", Input).value = parts[0] if len(parts) == 3 else song
-        self.query_one("#composer", Input).value = parts[1] if len(parts) == 3 else "Unknown"
-        self.query_one("#illustrator", Input).value = "Unknown"
+        self.query_one("#name", Input).value = info.name
+        self.query_one("#composer", Input).value = info.composer
+        self.query_one("#illustrator", Input).value = info.illustrator
         for diff in DIFFICULTIES:
             self.query_one(f"#row_{diff}", Horizontal).display = diff in old_available | new_available
             check = self.query_one(f"#check_{diff}", Checkbox)
@@ -217,8 +221,8 @@ class SongTUI(App):
                                style="bold green" if added else "bold red" if removed else "")
             check.value = present and diff == ("IN" if "IN" in new_available else available[0])
             check.disabled = not present or diff not in new_available
-            self.query_one(f"#level_{diff}", Input).value = diff
-            self.query_one(f"#charter_{diff}", Input).value = "Unknown"
+            self.query_one(f"#level_{diff}", Input).value = per_diff[diff].level
+            self.query_one(f"#charter_{diff}", Input).value = per_diff[diff].charter
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option_list.id == "song-list" and event.option_index < len(self.matches):
@@ -292,18 +296,23 @@ class SongTUI(App):
 
 
 def display_path(value: Path) -> str:
-    """Render the output directory as ./... when it lives under the home directory."""
+    """Show the output directory relative to the working directory when it is inside it.
+
+    Anything else stays absolute: rewriting an absolute path into "./..." would silently
+    resolve it against the working directory instead of the directory the user meant.
+    """
     try:
-        text = "./" + value.relative_to(Path.home()).as_posix()
+        relative = value.relative_to(Path.cwd())
     except ValueError:
-        text = str(value)
-    return text if text.endswith("/") else text + "/"
+        return str(value)
+    text = relative.as_posix()
+    return "./" if text in (".", "") else f"./{text}/"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="PhiExtract 歌曲资源提取（终端界面）")
     parser.add_argument("apk", type=Path, nargs="?", help="源 APK；留空则在界面中填写")
-    parser.add_argument("-o", "--output", type=Path, default=Path.home() / "extracted",
+    parser.add_argument("-o", "--output", type=Path, default=Path.cwd() / "extracted",
                         help="输出目录（默认 ./extracted/）")
     parser.add_argument("--asmc", type=Path, default=default_cli(), help="AssetStudioModCLI.exe 路径")
     args = parser.parse_args()

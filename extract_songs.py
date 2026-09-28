@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Extract Phigros song charts, music and illustrations from an APK.
 
+Song metadata (display name, composer, illustrator, chart constant, charter) is read
+from the game's own song table in the boot scene; `--meta` dumps it as JSON.
+
 Needs Python 3.9+ (standard library) and the bundled asmc/AssetStudioModCLI.exe (.NET 6+).
 Run `python extract_songs.py --help`.
 """
@@ -9,7 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
@@ -23,6 +26,7 @@ from typing import Callable, Mapping, Sequence
 import zipfile
 
 CATALOG = "assets/aa/catalog.json"
+LEVEL0 = "assets/bin/Data/level0"
 BUNDLE_ROOT = "assets/aa/Android/"
 # Shipped with the project (Windows x64, .NET 6+). Ship the whole asmc/ folder.
 BUNDLED_CLI = Path(__file__).resolve().parent / "asmc/AssetStudioModCLI.exe"
@@ -271,16 +275,171 @@ def available_difficulties(resources: list[Resource]) -> list[str]:
     return [d for d in priority if d in charts] + sorted(charts.difference(priority))
 
 
+@dataclass(frozen=True)
+class SongMeta:
+    """The game's own metadata for one song (see read_song_meta).
+
+    `difficulties`, `levels` and `charters` are parallel per-difficulty arrays;
+    a level of 0 means the song has no chart for that difficulty.
+    """
+
+    songs_id: str
+    name: str                       # display title (songsTitle)
+    search_name: str                # normalized name the game searches on (songsName)
+    composer: str
+    illustrator: str
+    difficulties: tuple[str, ...]
+    levels: tuple[float, ...]
+    charters: tuple[str, ...]
+    preview: tuple[float, float]
+
+    def _index(self, difficulty: str) -> int | None:
+        # "EZ_Error" style bonus charts share the base difficulty's metadata.
+        wanted = difficulty.removesuffix("_Error")
+        for index, label in enumerate(self.difficulties):
+            if label.removesuffix("_Error") == wanted:
+                return index
+        return None
+
+    def level_text(self, difficulty: str) -> str:
+        """"IN 14.4" style level text shown by the game, else the bare difficulty."""
+        index = self._index(difficulty)
+        if index is None or index >= len(self.levels) or self.levels[index] <= 0:
+            return difficulty
+        return f"{difficulty} {self.levels[index]:g}"
+
+    def charter_text(self, difficulty: str) -> str:
+        index = self._index(difficulty)
+        if index is not None and index < len(self.charters) and self.charters[index].strip():
+            return self.charters[index].strip()
+        return "Unknown"
+
+
+class _SongTable:
+    """Cursor over the song table embedded in the boot scene's binary payload."""
+
+    def __init__(self, blob: bytes):
+        self.blob = blob
+
+    def _count(self, offset: int, limit: int, label: str) -> int:
+        count = struct.unpack_from("<i", self.blob, offset)[0]
+        if not 0 <= count <= limit:
+            raise ValueError(f"bad {label} length {count} at {offset}")
+        return count
+
+    def text(self, offset: int) -> tuple[str, int]:
+        length = self._count(offset, 300, "string")
+        value = self.blob[offset + 4:offset + 4 + length].decode("utf-8")
+        end = offset + 4 + length
+        return value, end + (-end) % 4
+
+    def floats(self, offset: int) -> tuple[tuple[float, ...], int]:
+        count = self._count(offset, 16, "float array")
+        values = struct.unpack_from(f"<{count}f", self.blob, offset + 4) if count else ()
+        return values, offset + 4 + count * 4
+
+    def texts(self, offset: int) -> tuple[tuple[str, ...], int]:
+        count = self._count(offset, 16, "string array")
+        offset += 4
+        values = []
+        for _ in range(count):
+            value, offset = self.text(offset)
+            values.append(value)
+        return tuple(values), offset
+
+    def offsets(self, song_id: str):
+        key = song_id.encode("utf-8")
+        position = 0
+        while (position := self.blob.find(key, position)) >= 0:
+            start = position - 4
+            if start >= 0 and struct.unpack_from("<i", self.blob, start)[0] == len(key):
+                yield start
+            position += 1
+
+    def parse(self, start: int) -> dict:
+        song_id, offset = self.text(start)
+        name, offset = self.text(offset)
+        title, offset = self.text(offset)
+        offset += 4                                   # unknown int32, always 0 so far
+        levels, offset = self.floats(offset)
+        illustrator, offset = self.text(offset)
+        charters, offset = self.texts(offset)
+        composer, offset = self.text(offset)
+        difficulties, offset = self.texts(offset)
+        preview = tuple(struct.unpack_from("<2f", self.blob, offset))
+        return dict(song_id=song_id, name=name, title=title, levels=levels,
+                    illustrator=illustrator, charters=charters, composer=composer,
+                    difficulties=difficulties, preview=preview)
+
+
+def read_song_meta(archive: zipfile.ZipFile, song_ids: Sequence[str]) -> dict[str, SongMeta]:
+    """Read the game's own song table: name, composer, illustrator, level, charter.
+
+    Unity serializes one record per song into the boot scene without field names, so
+    the layout is decoded positionally:
+
+        string songsId, string songsName, string songsTitle, int32,
+        float[] levels, string illustrator, string[] charter, string composer,
+        string[] difficulty, float previewTime, float previewEndTime, ...
+
+    Verified against com.phi320.apk and com.phi40.apk: levels[i] > 0 matches the
+    exported Chart_<difficulty>.json set for every song that has a record. Songs
+    without a record (the Random.* placeholders) are simply absent from the result.
+    """
+    try:
+        table = _SongTable(archive.read(LEVEL0))
+    except KeyError:
+        return {}
+    found: dict[str, SongMeta] = {}
+    for song_id in song_ids:
+        best: dict | None = None
+        for start in table.offsets(song_id):
+            try:
+                record = table.parse(start)
+            except (ValueError, UnicodeDecodeError, struct.error):
+                continue
+            if record["song_id"] != song_id or not record["difficulties"]:
+                continue
+            score = (len(record["difficulties"]), len(record["levels"]),
+                     bool(record["composer"]), bool(record["illustrator"]))
+            if best is None or score > best["score"]:
+                record["score"] = score
+                best = record
+        if best is not None:
+            found[song_id] = SongMeta(
+                songs_id=song_id, name=best["title"] or best["name"],
+                search_name=best["name"], composer=best["composer"],
+                illustrator=best["illustrator"], difficulties=best["difficulties"],
+                levels=best["levels"], charters=best["charters"],
+                preview=best["preview"])
+    return found
+
+
+def song_metadata(meta: SongMeta | None, song: str, difficulties: Sequence[str]
+                  ) -> tuple[SongInfo, dict[str, DifficultyInfo]]:
+    """info.txt values for one song: the APK's table if present, else the song ID."""
+    if meta is None:
+        parts = song.rsplit(".", 2)
+        name = parts[0] if len(parts) == 3 else song
+        composer = parts[1] if len(parts) == 3 else "Unknown"
+        return (SongInfo(name, composer, "Unknown"),
+                {d: DifficultyInfo(d, "Unknown") for d in difficulties})
+    return (SongInfo(meta.name, meta.composer or "Unknown", meta.illustrator or "Unknown"),
+            {d: DifficultyInfo(meta.level_text(d), meta.charter_text(d)) for d in difficulties})
+
+
 def render_info(song: SongInfo, difficulty: DifficultyInfo, chart: str,
                 music: str, picture: str) -> str:
     values = (song.name, song.composer, song.illustrator, difficulty.level,
               difficulty.charter, chart, music, picture)
     if any(not v.strip() or "\n" in v or "\r" in v or "\x00" in v for v in values):
         raise ExtractionError("info.txt fields must be non-empty single-line text")
+    # RPE documents the artist field as "Illustration"; most community tools read
+    # "Illustrator", so write both keys and let the reader pick.
     return (f"#\nName: {song.name}\nSong: {music}\nChart: {chart}\n"
             f"Picture: {picture}\nLevel: {difficulty.level}\n"
-            f"Composer: {song.composer}\nIllustrator: {song.illustrator}\n"
-            f"Charter: {difficulty.charter}\n")
+            f"Composer: {song.composer}\nIllustration: {song.illustrator}\n"
+            f"Illustrator: {song.illustrator}\nCharter: {difficulty.charter}\n")
 
 
 def extract_difficulties(archive: zipfile.ZipFile, song: str, resources: list[Resource],
@@ -370,25 +529,37 @@ def select_songs(songs: dict[str, list[Resource]], selectors: list[str], all_son
     return sorted(chosen)
 
 
+def expand_path(value: Path) -> Path:
+    """Expand ~ in paths typed by the user (PowerShell/cmd do not expand it for us)."""
+    return Path(os.path.expanduser(str(value)))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n  python extract_songs.py com.phi40.apk --list\n"
                "  python extract_songs.py com.phi40.apk -s 000AinSophAur -o output\n"
+               "  python extract_songs.py com.phi40.apk -s Igallta --info -o output\n"
+               "  python extract_songs.py com.phi40.apk --meta -o meta.json\n"
                "  python extract_songs.py com.phi320.apk --all -o output_320")
     parser.add_argument("apk", type=Path, help="source game APK")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--list", action="store_true", help="list available track IDs")
+    mode.add_argument("--meta", action="store_true", help="dump the game's song metadata table as JSON (to stdout, or to -o FILE)")
     mode.add_argument("-s", "--song", action="append", metavar="ID", help="exact or unique substring of song ID; repeatable")
     mode.add_argument("--all", action="store_true", help="export all tracks (requires substantial disk space)")
     parser.add_argument("-o", "--output", type=Path, help="output directory (required for export)")
+    parser.add_argument("--info", action="store_true",
+                        help="export one directory per difficulty with info.txt filled from the APK")
     parser.add_argument("--asmc", type=Path, default=default_cli(), help="AssetStudioModCLI.exe path")
     args = parser.parse_args(argv)
-    if not args.list and args.output is None:
+    apk = expand_path(args.apk)
+    cli = expand_path(args.asmc)
+    if not args.list and not args.meta and args.output is None:
         parser.error("-o/--output is required for extraction")
-    if not args.list and not args.asmc.is_file():
-        parser.error(f"AssetStudioModCLI not found: {args.asmc}")
+    if not args.list and not args.meta and not cli.is_file():
+        parser.error(f"AssetStudioModCLI not found: {cli}")
     try:
-        with zipfile.ZipFile(args.apk) as archive:
+        with zipfile.ZipFile(apk) as archive:
             catalog = Catalog(json.loads(archive.read(CATALOG)))
             songs = catalog.songs(archive)
             if args.list:
@@ -396,16 +567,41 @@ def main(argv: list[str] | None = None) -> int:
                     print(name)
                 print(f"{len(songs)} tracks total", file=sys.stderr)
                 return 0
+            if args.meta:
+                table = read_song_meta(archive, sorted(songs))
+                records = {name: asdict(meta) for name, meta in sorted(table.items())}
+                if args.output:
+                    # Writing the file ourselves avoids the console/PowerShell encoding
+                    # (cmd pipes mangle UTF-8, PowerShell 5.1 redirects to UTF-16).
+                    destination = expand_path(args.output)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n",
+                                           encoding="utf-8")
+                    print(f"Wrote {destination} ({len(table)}/{len(songs)} tracks)", file=sys.stderr)
+                else:
+                    # stdout: stay ASCII so any console/pipe encoding still yields valid JSON
+                    print(json.dumps(records, indent=2))
+                    print(f"{len(table)}/{len(songs)} tracks have game metadata", file=sys.stderr)
+                return 0
             selected = select_songs(songs, args.song or [], args.all)
-            output = args.output.resolve()
+            output = expand_path(args.output).resolve()
             if not selected:
                 raise ExtractionError("No tracks selected")
-            print(f"Selected {len(selected)} track(s) from {args.apk}", flush=True)
+            print(f"Selected {len(selected)} track(s) from {apk}", flush=True)
+            table = read_song_meta(archive, selected) if args.info else {}
+            if args.info:
+                print(f"Game metadata for {len(table)}/{len(selected)} track(s)", flush=True)
             successes = 0
             failures = []
             for song in selected:
                 try:
-                    extract_song(archive, song, songs[song], output, args.asmc.resolve())
+                    if args.info:
+                        difficulties = available_difficulties(songs[song])
+                        info, per_diff = song_metadata(table.get(song), song, difficulties)
+                        extract_difficulties(archive, song, songs[song], difficulties, output,
+                                             cli.resolve(), info, per_diff)
+                    else:
+                        extract_song(archive, song, songs[song], output, cli.resolve())
                     successes += 1
                 except (ExtractionError, OSError, zipfile.BadZipFile) as exc:
                     print(f"ERROR {song}: {exc}", file=sys.stderr, flush=True)
