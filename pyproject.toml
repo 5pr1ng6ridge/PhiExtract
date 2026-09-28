@@ -1,0 +1,17 @@
+[project]
+name = "phiextract"
+version = "0.1.0"
+description = "phigros charts extractor"
+readme = "README.md"
+authors = [
+    { name = "5pr1ng6ridge", email = "1008654188616sb@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+phiextract = "phiextract:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
