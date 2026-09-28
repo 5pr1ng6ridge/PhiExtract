@@ -1,7 +1,8 @@
 # PhiExtract
 
 从 Phigros APK 提取歌曲资源（谱面 / 音频 / 曲绘），并生成 `info.txt`，支持4.0版本。
-曲名 / 曲师 / 画师 / **定数** / 谱师 直接从 APK 自带元数据读取，无需手填。
+
+曲名 / 曲师 / 画师 / 定数 / 谱师 直接从 APK 自带元数据读取。
 
 - **TUI**：`song_tui.py` —— 搜索曲目、勾选难度、填写元数据后导出（推荐）
 - **CLI**：`extract_songs.py` —— 脚本化批量导出
@@ -30,7 +31,7 @@ python song_tui.py D:\games\com.phi40.apk -o D:\out      # 也可以直接传参
 3. 右侧勾选难度；Level / Charter / Name / Composer / Illustrator 已自动填好，可直接修改
 4. 确认输出目录（默认 `./extracted/`）→ 点「开始导出」
 
-快捷键：`Ctrl+F` 搜索、`Ctrl+E` 导出、`Ctrl+Q` 退出。导出在后台线程执行，底部显示进度与错误。
+快捷键：`Ctrl+F` 搜索、`Ctrl+E` 导出、`Ctrl+Q` 退出。导出在后台线程执行。底部显示进度与错误。
 
 连续加载两个 APK 时会与**上一个成功加载的版本**比较：新增曲目绿色 `＋`、移除曲目红色 `－`，共同曲目的难度增减同样标色。被移除的曲目只能查看，无法从当前 APK 导出。
 
