@@ -4,13 +4,14 @@
 Song metadata (display name, composer, illustrator, chart constant, charter) is read
 from the game's own song table in the boot scene; `--meta` dumps it as JSON.
 
-Needs Python 3.9+ (standard library) and the bundled asmc/AssetStudioModCLI.exe (.NET 6+).
+Needs Python 3.9+, requirements.txt, and the bundled asmc/AssetStudioModCLI.exe (.NET 6+).
 Run `python extract_songs.py --help`.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 import json
@@ -27,10 +28,18 @@ import zipfile
 
 CATALOG = "assets/aa/catalog.json"
 LEVEL0 = "assets/bin/Data/level0"
+PACKED_DATA = "assets/bin/Data/data.unity3d"
 BUNDLE_ROOT = "assets/aa/Android/"
 # Shipped with the project (Windows x64, .NET 6+). Ship the whole asmc/ folder.
 BUNDLED_CLI = Path(__file__).resolve().parent / "asmc/AssetStudioModCLI.exe"
 DEFAULT_CLI = BUNDLED_CLI
+# The April Fools SP chart is stored under Chart_IN in this particular release.
+APRIL_SP_SONG = "OblivionPHIN.Daily天利vsEndCat终猫ftAiSSw夜輪.0"
+# The unfinished Chapter 9 sequence uses encrypted, individually addressed assets.
+C9_SONG = "TrueHomeTrueWorld.C9.0"
+C9_ASSETS = {"Chart.json": "c9s.ilBx0rGL", "music.wav": "c9s.MYy0ioG2",
+             "IllustrationBlur.jpg": "c9s.U8WX0Xsd"}
+C9_PASSWORD = "Backward, go backward, turn back to the antemundane realm, go back to the -"
 
 
 def default_cli() -> Path:
@@ -51,6 +60,7 @@ class ExtractionError(Exception):
 class Resource:
     address: str
     bundle_path: str
+    encrypted: bool = False
 
     @property
     def name(self) -> str:
@@ -70,6 +80,9 @@ class Catalog:
         self.bundle_providers = {
             i for i, name in enumerate(providers)
             if name.endswith(".AssetBundleProvider") or name.endswith(".C9SecretAssetBundleProvider")
+        }
+        self.secret_bundle_providers = {
+            i for i, name in enumerate(providers) if name.endswith(".C9SecretAssetBundleProvider")
         }
         if not self.asset_providers or not self.bundle_providers:
             raise ExtractionError("Catalog lacks a supported bundled-asset/bundle provider")
@@ -151,18 +164,42 @@ class Catalog:
                 if internal not in available:
                     # Older APKs stored bundles under their catalog key instead of internal id.
                     alternative = BUNDLE_ROOT + legacy.rsplit("/", 1)[-1]
-                    if alternative not in available:
-                        raise ExtractionError(f"Missing bundle for {key}: {internal} (fallback {alternative})")
-                    internal = alternative
+                    if alternative in available:
+                        internal = alternative
+                    # Keep an unresolved resource so export can distinguish a missing
+                    # optional image/audio from a missing required chart and warn.
                 previous = songs[song].get(key)
                 if previous is not None and previous.bundle_path != internal:
                     raise ExtractionError(f"Conflicting bundles for {key}")
                 songs[song][key] = Resource(key, internal)
         # Chapter covers also live under Assets/Tracks, but are not songs.
-        return {song: sorted(resources.values(), key=lambda r: r.address)
-                for song, resources in songs.items()
-                if any(r.name.startswith("Chart_") and r.name.endswith(".json") for r in resources.values())
-                and any(r.name.endswith(".wav") for r in resources.values())}
+        result = {song: sorted(resources.values(), key=lambda r: r.address)
+                  for song, resources in songs.items()
+                  if any(r.name.startswith("Chart_") and r.name.endswith(".json") for r in resources.values())}
+        # Recognize the known Chapter 9 chart by its asset key, not a filename.
+        # Missing optional music/art must not hide an otherwise exportable chart.
+        keys = {key: refs for key, refs in self.keys if isinstance(key, str)}
+        if C9_ASSETS["Chart.json"] in keys:
+            secret = []
+            for name, key in C9_ASSETS.items():
+                if key not in keys:
+                    continue
+                refs = [i for i in keys[key] if i < len(self.entries)
+                        and self.entries[i][1] in self.asset_providers]
+                if not refs:
+                    raise ExtractionError(f"Missing Chapter 9 asset: {key}")
+                paths = {self.get_bundle(i)[0] for i in refs}
+                if len(paths) != 1:
+                    raise ExtractionError(f"Ambiguous Chapter 9 bundles for {key}: {paths}")
+                path = paths.pop()
+                dep = self.entries[refs[0]][2]
+                providers = {self.entries[j][1] for j in self.keys[dep][1]
+                             if j < len(self.entries) and self.entries[j][1] in self.bundle_providers}
+                if providers != self.secret_bundle_providers or len(providers) != 1:
+                    raise ExtractionError(f"Not an encrypted Chapter 9 resource: {key}")
+                secret.append(Resource(f"Assets/Tracks/{C9_SONG}/{name}", path, encrypted=True))
+            result[C9_SONG] = secret
+        return result
 
 
 def safe_name(name: str) -> str:
@@ -173,6 +210,44 @@ def safe_name(name: str) -> str:
     }:
         raise ExtractionError(f"Unsafe song name: {name!r}")
     return result
+
+
+def copy_bundles(archive: zipfile.ZipFile, resources: list[Resource], destination: Path) -> int:
+    """Stage required bundles; decrypt only the known Chapter 9 assets in staging."""
+    bundles: dict[str, bool] = {}
+    for r in resources:
+        if r.name.endswith(".c9Locked"):
+            continue
+        if r.bundle_path in bundles and bundles[r.bundle_path] != r.encrypted:
+            raise ExtractionError(f"Conflicting encryption status: {r.bundle_path}")
+        bundles[r.bundle_path] = r.encrypted
+    for path, encrypted in sorted(bundles.items()):
+        filename = path.rsplit("/", 1)[-1]
+        if filename in ("", ".", "..") or "\\" in filename:
+            raise ExtractionError(f"Unsafe bundle filename: {filename!r}")
+        target = destination / filename
+        if encrypted:
+            try:
+                from Crypto.Cipher import AES
+                from Crypto.Util.Padding import unpad
+            except ImportError as exc:
+                raise ExtractionError("Chapter 9 needs pycryptodome; pip install -r requirements.txt") from exc
+            key = hashlib.sha512(C9_PASSWORD.encode("utf-8")).digest()
+            data = archive.read(path)
+            if len(data) % AES.block_size:
+                raise ExtractionError(f"Invalid encrypted bundle size: {path}")
+            try:
+                plain = unpad(AES.new(key[:32], AES.MODE_CBC, key[32:48]).decrypt(data),
+                              AES.block_size)
+            except ValueError as exc:
+                raise ExtractionError(f"Cannot decrypt Chapter 9 bundle: {path}") from exc
+            if not plain.startswith(b"UnityFS\0"):
+                raise ExtractionError(f"Chapter 9 bundle has an unexpected header: {path}")
+            target.write_bytes(plain)
+        else:
+            with archive.open(path) as src, target.open("wb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+    return len(bundles)
 
 
 def expected_files(resources: list[Resource]) -> dict[str, str]:
@@ -210,6 +285,48 @@ def find_exported(export_dir: Path, name: str) -> Path:
     return found[0]
 
 
+def convert_resources(archive: zipfile.ZipFile, resources: list[Resource], root: Path,
+                      cli: Path, progress: Callable[[str], None],
+                      warning: Callable[[str], None]) -> dict[str, Path]:
+    """Missing optional media is recoverable; charts and converter failures are not."""
+    names = expected_files(resources)
+    available = set(archive.namelist())
+    staged = []
+    for r in resources:
+        if r.name.endswith(".c9Locked"):
+            continue
+        if r.bundle_path not in available:
+            if r.name.lower().endswith(".json"):
+                raise ExtractionError(f"Missing chart bundle: {r.address}")
+            warning(f"缺失资源 {r.name}：APK 中没有对应 bundle，将继续导出。")
+        else:
+            staged.append(r)
+    bundles_dir, export_dir = root / "bundles", root / "export"
+    bundles_dir.mkdir()
+    export_dir.mkdir()
+    count = copy_bundles(archive, staged, bundles_dir)
+    progress(f"Converting {count} bundle(s) with AssetStudioModCLI...")
+    cmd = [str(cli), str(bundles_dir), "-m", "export", "-t", "tex2d,textAsset,audio",
+           "-g", "none", "-o", str(export_dir), "--image-format", "jpg",
+           "--audio-format", "wav", "--log-level", "warning"]
+    result = subprocess.run(cmd, cwd=str(cli.parent), stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, errors="replace")
+    if result.returncode:
+        raise ExtractionError(f"AssetStudio failed (exit {result.returncode}):\n{result.stdout[-4000:]}")
+    files = {}
+    present_names = {r.name for r in staged}
+    for name in names.values():
+        if name not in present_names:
+            continue
+        try:
+            files[name] = find_exported(export_dir, name)
+        except ExtractionError:
+            if name.lower().endswith(".json"):
+                raise
+            warning(f"资源 {name} 未得到非空导出文件，将继续导出其它资源。")
+    return files
+
+
 def extract_song(archive: zipfile.ZipFile, song: str, resources: list[Resource],
                  output: Path, cli: Path) -> int:
     # Never let AssetStudio write into final output directly: verify first, then commit.
@@ -222,26 +339,8 @@ def extract_song(archive: zipfile.ZipFile, song: str, resources: list[Resource],
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".phiextract_", dir=output) as temp:
         root = Path(temp)
-        bundles_dir = root / "bundles"
-        export_dir = root / "export"
-        bundles_dir.mkdir()
-        export_dir.mkdir()
-        bundles = sorted({resource.bundle_path for resource in resources
-                          if not resource.name.endswith(".c9Locked")})
-        for path in bundles:
-            # Paths came from the catalog but always validate before filesystem writes.
-            filename = path.rsplit("/", 1)[-1]
-            with archive.open(path) as src, (bundles_dir / filename).open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
-        print(f"  {song}: {len(bundles)} bundles -> AssetStudio", flush=True)
-        cmd = [str(cli), str(bundles_dir), "-m", "export", "-t", "tex2d,textAsset,audio",
-               "-g", "none", "-o", str(export_dir), "--image-format", "jpg",
-               "--audio-format", "wav", "--log-level", "warning"]
-        result = subprocess.run(cmd, cwd=str(cli.parent), stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, errors="replace")
-        if result.returncode:
-            raise ExtractionError(f"AssetStudio failed (exit {result.returncode}):\n{result.stdout[-4000:]}")
-        planned = {name: find_exported(export_dir, name) for name in names.values()}
+        planned = convert_resources(archive, resources, root, cli, print,
+                                    lambda message: print(f"WARNING: {message}", file=sys.stderr))
         destination.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(temp) / "ready"
         staging.mkdir()
@@ -269,9 +368,16 @@ class DifficultyInfo:
 
 
 def available_difficulties(resources: list[Resource]) -> list[str]:
+    song = resources[0].address.split("/")[2] if resources else ""
+    if song == C9_SONG:
+        return ["C9"] if any(r.name == "Chart.json" for r in resources) else []
     charts = {r.name[6:-5] for r in resources
               if r.name.startswith("Chart_") and r.name.endswith(".json")}
-    priority = ("EZ", "HD", "IN", "AT")
+    # This April Fools-only chart is a SP chart despite its internal filename.
+    if song == APRIL_SP_SONG and "IN" in charts:
+        charts.remove("IN")
+        charts.add("SP")
+    priority = ("EZ", "HD", "IN", "AT", "Legacy", "SP")
     return [d for d in priority if d in charts] + sorted(charts.difference(priority))
 
 
@@ -372,7 +478,23 @@ class _SongTable:
                     difficulties=difficulties, preview=preview)
 
 
-def read_song_meta(archive: zipfile.ZipFile, song_ids: Sequence[str]) -> dict[str, SongMeta]:
+def _read_boot_scene(archive: zipfile.ZipFile) -> bytes:
+    """Old APKs store level0 directly; new ones place it inside data.unity3d."""
+    members = set(archive.namelist())
+    if LEVEL0 in members:
+        return archive.read(LEVEL0)
+    if PACKED_DATA not in members:
+        raise ExtractionError("APK lacks both level0 and data.unity3d metadata sources")
+    from unityfs import UnityFSError, read_file
+    try:
+        with archive.open(PACKED_DATA) as stream:
+            return read_file(stream, archive.getinfo(PACKED_DATA).file_size, "level0")
+    except UnityFSError as exc:
+        raise ExtractionError(f"Cannot read packed song metadata: {exc}") from exc
+
+
+def read_song_meta(archive: zipfile.ZipFile, song_ids: Sequence[str], *,
+                   warning: Callable[[str], None] | None = None) -> dict[str, SongMeta]:
     """Read the game's own song table: name, composer, illustrator, level, charter.
 
     Unity serializes one record per song into the boot scene without field names, so
@@ -382,13 +504,17 @@ def read_song_meta(archive: zipfile.ZipFile, song_ids: Sequence[str]) -> dict[st
         float[] levels, string illustrator, string[] charter, string composer,
         string[] difficulty, float previewTime, float previewEndTime, ...
 
-    Verified against com.phi320.apk and com.phi40.apk: levels[i] > 0 matches the
-    exported Chart_<difficulty>.json set for every song that has a record. Songs
-    without a record (the Random.* placeholders) are simply absent from the result.
+    The table is in standalone level0 (older releases) or packed data.unity3d
+    (4.0.1). Songs without a record (Random.* and event/secret songs) are absent.
+    Source/read failures warn and return fallback metadata, without blocking export.
     """
+    if not song_ids:
+        return {}
+    report_warning = warning or warning_to_stderr
     try:
-        table = _SongTable(archive.read(LEVEL0))
-    except KeyError:
+        table = _SongTable(_read_boot_scene(archive))
+    except (ExtractionError, OSError, zipfile.BadZipFile) as exc:
+        report_warning(f"元数据读取失败：{exc}；字段将使用回退值，仍可导出谱面。")
         return {}
     found: dict[str, SongMeta] = {}
     for song_id in song_ids:
@@ -412,6 +538,8 @@ def read_song_meta(archive: zipfile.ZipFile, song_ids: Sequence[str]) -> dict[st
                 illustrator=best["illustrator"], difficulties=best["difficulties"],
                 levels=best["levels"], charters=best["charters"],
                 preview=best["preview"])
+    if not found:
+        report_warning("所选曲目未解析到游戏元数据；字段将使用回退值，仍可导出谱面。")
     return found
 
 
@@ -419,9 +547,14 @@ def song_metadata(meta: SongMeta | None, song: str, difficulties: Sequence[str]
                   ) -> tuple[SongInfo, dict[str, DifficultyInfo]]:
     """info.txt values for one song: the APK's table if present, else the song ID."""
     if meta is None:
+        if song == C9_SONG:
+            return (SongInfo("True Home, True World (Chapter 9 unfinished)", "Unknown", "Unknown"),
+                    {d: DifficultyInfo("C9 (incomplete)", "Unknown") for d in difficulties})
         parts = song.rsplit(".", 2)
         name = parts[0] if len(parts) == 3 else song
         composer = parts[1] if len(parts) == 3 else "Unknown"
+        if song == APRIL_SP_SONG:
+            name = "Oblivion: PHIN"
         return (SongInfo(name, composer, "Unknown"),
                 {d: DifficultyInfo(d, "Unknown") for d in difficulties})
     return (SongInfo(meta.name, meta.composer or "Unknown", meta.illustrator or "Unknown"),
@@ -442,66 +575,110 @@ def render_info(song: SongInfo, difficulty: DifficultyInfo, chart: str,
             f"Illustrator: {song.illustrator}\nCharter: {difficulty.charter}\n")
 
 
+def picture_for_difficulty(pictures: set[str], difficulty: str) -> str | None:
+    """Prefer that difficulty's cover; never borrow another difficulty's image."""
+    base = difficulty.removesuffix("_Error")
+    suffixes = list(dict.fromkeys((f"_{difficulty}", f"_{base}", "")))
+    for suffix in suffixes:
+        for stem in ("Illustration", "IllustrationLowRes", "IllustrationBlur"):
+            for ext in (".jpg", ".jpeg", ".png"):
+                candidate = stem + suffix + ext
+                if candidate in pictures:
+                    return candidate
+    return None
+
+
+def zip_filename(title: str, song_id: str, difficulty: str) -> str:
+    """Use the display title (or ID if empty), sanitized for Windows filenames."""
+    try:
+        name = safe_name(title.strip()[:120])
+    except ExtractionError:
+        name = safe_name(song_id[:120])
+    return safe_name(f"{name}_{difficulty}") + ".zip"
+
+
+def warning_to_stderr(message: str) -> None:
+    print(f"WARNING: {message}", file=sys.stderr, flush=True)
+
+
 def extract_difficulties(archive: zipfile.ZipFile, song: str, resources: list[Resource],
                          difficulties: Sequence[str], output: Path, cli: Path,
                          info: SongInfo, per_difficulty: Mapping[str, DifficultyInfo],
-                         progress: Callable[[str], None] = print) -> list[Path]:
-    """Export selected charts and shared media once; commit one directory per difficulty.
+                         progress: Callable[[str], None] = print, *,
+                         warning: Callable[[str], None] = warning_to_stderr,
+                         make_zip: bool = False) -> list[Path]:
+    """Export charts even without info.txt; optional ZIPs contain files at their root.
 
-    Existing difficulty directories are never overwritten. A failed conversion leaves
-    no completed output; a rare failure during commit retains any already committed
-    directories and reports the failure instead of claiming total success.
+    Missing/invalid optional media or info values produce warnings, not fake references.
+    Required chart/converter failures still abort. Stage everything before publishing;
+    never overwrite existing directories/ZIPs. A partial publish error retains completed
+    outputs and reports an error, not total success.
     """
     available = available_difficulties(resources)
     selected = list(dict.fromkeys(difficulties))
-    if not selected or any(d not in available or d not in per_difficulty for d in selected):
+    if not selected or any(d not in available for d in selected):
         raise ExtractionError(f"Choose available difficulties: {', '.join(available)}")
     lookup = {r.name: r for r in resources}
-    picture = next((p for p in ("Illustration.jpg", "IllustrationLowRes.jpg", "IllustrationBlur.jpg")
-                    if p in lookup), None)
-    if picture is None:
-        raise ExtractionError(f"{song} has no illustration; cannot make a valid info.txt")
+    pictures = {p for p in lookup if p.lower().endswith((".jpg", ".jpeg", ".png"))}
     plans = {}
+    zip_targets = {}
     for diff in selected:
-        chart = f"Chart_{diff}.json"
-        music = ("music_IN.wav" if diff == "IN" and "music_IN.wav" in lookup else "music.wav")
-        if music not in lookup:
-            raise ExtractionError(f"No music for {song} / {diff}")
-        text = render_info(info, per_difficulty[diff], chart, music, picture)
+        chart = ("Chart.json" if song == C9_SONG else
+                 "Chart_IN.json" if song == APRIL_SP_SONG and diff == "SP" else
+                 f"Chart_{diff}.json")
+        if chart not in lookup:
+            raise ExtractionError(f"Missing chart resource: {song} / {diff}")
+        chart_output = f"Chart_{diff}.json" if diff in ("SP", "C9") else chart
+        music = next((m for m in (f"music_{diff}.wav",
+                                  f"music_{diff.removesuffix('_Error')}.wav", "music.wav")
+                      if m in lookup), None)
         destination = output / safe_name(song) / safe_name(diff)
         if destination.exists():
             raise ExtractionError(f"Output already exists (not overwriting): {destination}")
-        plans[diff] = (chart, music, text, destination)
-    chosen = {name for chart, music, _, _ in plans.values() for name in (chart, music, picture)}
-    selected_resources = [lookup[name] for name in chosen]
-    expected_files(selected_resources)
+        if make_zip:
+            zip_target = output / zip_filename(info.name, song, diff)
+            if zip_target.exists() or zip_target in zip_targets.values():
+                raise ExtractionError(f"ZIP already exists or name conflicts (not overwriting): {zip_target}")
+            zip_targets[diff] = zip_target
+        plans[diff] = (chart, chart_output, music, destination)
+    chosen = pictures | {name for chart, _, music, _ in plans.values()
+                         for name in (chart, music) if name is not None}
+    selected_resources = [lookup[name] for name in sorted(chosen)]
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".phiextract_", dir=output) as temp:
         root = Path(temp)
-        bundles_dir, export_dir = root / "bundles", root / "export"
-        bundles_dir.mkdir()
-        export_dir.mkdir()
-        bundles = sorted({r.bundle_path for r in selected_resources})
-        progress(f"{song}: copying {len(bundles)} bundle(s)")
-        for path in bundles:
-            filename = path.rsplit("/", 1)[-1]
-            with archive.open(path) as src, (bundles_dir / filename).open("wb") as dst:
-                shutil.copyfileobj(src, dst, length=1024 * 1024)
-        progress("Converting assets with AssetStudioModCLI...")
-        cmd = [str(cli), str(bundles_dir), "-m", "export", "-t", "tex2d,textAsset,audio",
-               "-g", "none", "-o", str(export_dir), "--image-format", "jpg",
-               "--audio-format", "wav", "--log-level", "warning"]
-        result = subprocess.run(cmd, cwd=str(cli.parent), stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, errors="replace")
-        if result.returncode:
-            raise ExtractionError(f"AssetStudio failed (exit {result.returncode}):\n{result.stdout[-4000:]}")
-        files = {name: find_exported(export_dir, name) for name in chosen}
-        for diff, (chart, music, text, _) in plans.items():
+        files = convert_resources(archive, selected_resources, root, cli, progress, warning)
+        actual_pictures = pictures.intersection(files)
+        for diff, (chart, chart_output, music, _) in plans.items():
             folder = root / "ready" / diff
             folder.mkdir(parents=True)
-            for name in (chart, music, picture):
+            for name in sorted(actual_pictures | ({music} if music in files else set())):
                 shutil.copyfile(files[name], folder / name)
-            (folder / "info.txt").write_text(text, encoding="utf-8", newline="\n")
+            shutil.copyfile(files[chart], folder / chart_output)
+            picture = picture_for_difficulty(actual_pictures, diff)
+            missing = []
+            if music not in files:
+                missing.append("音频")
+            if picture is None:
+                missing.append("适用曲绘")
+            if diff not in per_difficulty:
+                missing.append("难度信息")
+            text = None
+            if missing:
+                warning(f"{song} / {diff}：缺失 {'、'.join(missing)}，已导出可用资源，不生成 info.txt。")
+            else:
+                try:
+                    text = render_info(info, per_difficulty[diff], chart_output, music, picture)
+                except ExtractionError as exc:
+                    warning(f"{song} / {diff}：{exc}，已导出可用资源，不生成 info.txt。")
+            if text is not None:
+                (folder / "info.txt").write_text(text, encoding="utf-8", newline="\n")
+            if make_zip:
+                progress(f"Compressing: {zip_targets[diff].name}")
+                with zipfile.ZipFile(root / f"{diff}.zip", "w", zipfile.ZIP_DEFLATED,
+                                     compresslevel=6) as package:
+                    for file in sorted(folder.iterdir()):
+                        package.write(file, file.name)
         completed = []
         for diff, (_, _, _, destination) in plans.items():
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -510,6 +687,11 @@ def extract_difficulties(archive: zipfile.ZipFile, song: str, resources: list[Re
             os.rename(root / "ready" / diff, destination)
             completed.append(destination)
             progress(f"Saved: {destination}")
+            if make_zip:
+                # Exclusive, atomic publication: link fails if another process created
+                # this name while we converted. The staged link is removed on cleanup.
+                os.link(root / f"{diff}.zip", zip_targets[diff])
+                progress(f"ZIP: {zip_targets[diff]}")
         return completed
 
 
@@ -550,8 +732,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-o", "--output", type=Path, help="output directory (required for export)")
     parser.add_argument("--info", action="store_true",
                         help="export one directory per difficulty with info.txt filled from the APK")
+    parser.add_argument("--zip", dest="make_zip", action="store_true",
+                        help="export per difficulty (implies --info) and also create Title_Difficulty.zip")
     parser.add_argument("--asmc", type=Path, default=default_cli(), help="AssetStudioModCLI.exe path")
     args = parser.parse_args(argv)
+    if args.make_zip and (args.list or args.meta):
+        parser.error("--zip is only valid for song export")
     apk = expand_path(args.apk)
     cli = expand_path(args.asmc)
     if not args.list and not args.meta and args.output is None:
@@ -588,18 +774,18 @@ def main(argv: list[str] | None = None) -> int:
             if not selected:
                 raise ExtractionError("No tracks selected")
             print(f"Selected {len(selected)} track(s) from {apk}", flush=True)
-            table = read_song_meta(archive, selected) if args.info else {}
-            if args.info:
+            table = read_song_meta(archive, selected) if args.info or args.make_zip else {}
+            if args.info or args.make_zip:
                 print(f"Game metadata for {len(table)}/{len(selected)} track(s)", flush=True)
             successes = 0
             failures = []
             for song in selected:
                 try:
-                    if args.info:
+                    if args.info or args.make_zip:
                         difficulties = available_difficulties(songs[song])
                         info, per_diff = song_metadata(table.get(song), song, difficulties)
                         extract_difficulties(archive, song, songs[song], difficulties, output,
-                                             cli.resolve(), info, per_diff)
+                                             cli.resolve(), info, per_diff, make_zip=args.make_zip)
                     else:
                         extract_song(archive, song, songs[song], output, cli.resolve())
                     successes += 1

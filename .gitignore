@@ -1,5 +1,6 @@
 *.apk
 *.zip
+extracted/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

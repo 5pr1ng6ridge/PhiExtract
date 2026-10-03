@@ -18,7 +18,7 @@ from extract_songs import (CATALOG, Catalog, DifficultyInfo, ExtractionError, So
                            available_difficulties, default_cli, extract_difficulties,
                            read_song_meta, song_metadata)
 
-DIFFICULTIES = ("EZ", "HD", "IN", "AT", "Legacy", "EZ_Error", "HD_Error", "IN_Error")
+DIFFICULTIES = ("EZ", "HD", "IN", "AT", "Legacy", "SP", "C9", "EZ_Error", "HD_Error", "IN_Error")
 
 
 class SongTUI(App):
@@ -71,11 +71,12 @@ class SongTUI(App):
     BINDINGS = [("ctrl+f", "focus_search", "搜索"), ("ctrl+e", "start_export", "导出"),
                 ("ctrl+q", "quit", "退出")]
 
-    def __init__(self, apk: Path | None, output: Path, cli: Path):
+    def __init__(self, apk: Path | None, output: Path, cli: Path, make_zip: bool = False):
         super().__init__()
         self.initial_apk = apk
         self.initial_output = output
         self.cli = cli
+        self.initial_zip = make_zip
         self.current_apk: Path | None = None
         self.songs: dict = {}
         self.meta: dict = {}
@@ -99,6 +100,7 @@ class SongTUI(App):
                 yield Input(value=display_path(self.initial_output), id="output",
                             placeholder="输出文件夹")
                 yield Button("开始导出", id="export")
+            yield Checkbox("自动 ZIP（曲名_难度，保留原目录）", value=self.initial_zip, id="auto-zip")
         with Horizontal(id="body"):
             with Vertical(id="left"):
                 yield Input(id="search", placeholder="搜索歌曲 ID / 曲名 / 作者 (Ctrl+F)")
@@ -117,7 +119,7 @@ class SongTUI(App):
                     with Horizontal(classes="field"):
                         yield Label(label)
                         yield Input(id=field)
-                yield Static("info.txt 的 Song/Chart/Picture 自动填写实际文件名。")
+                yield Static("按难度选择曲绘；缺资源或必填字段时仅提示，仍导出谱面，不生成 info.txt。")
         yield RichLog(id="log", wrap=True, highlight=False)
         yield Footer()
 
@@ -146,7 +148,7 @@ class SongTUI(App):
         try:
             with zipfile.ZipFile(path) as archive:
                 songs = Catalog(json.loads(archive.read(CATALOG))).songs(archive)
-                meta = read_song_meta(archive, sorted(songs))
+                meta = read_song_meta(archive, sorted(songs), warning=self._export_warning)
             if not songs:
                 raise ExtractionError("APK contains no songs")
         except (OSError, ValueError, KeyError, IndexError, zipfile.BadZipFile, ExtractionError) as exc:
@@ -270,29 +272,45 @@ class SongTUI(App):
             self.query_one("#export", Button).disabled = True
             self.query_one("#load", Button).disabled = True
             self._log(f"准备导出 {song}: {', '.join(selected)}")
-            self.export_worker(apk, song, selected, target.resolve(), info, per_diff)
+            make_zip = self.query_one("#auto-zip", Checkbox).value
+            self.export_worker(apk, song, selected, target.resolve(), info, per_diff, make_zip)
         except (OSError, ExtractionError) as exc:
             self._log(f"错误: {exc}")
             self.notify(str(exc), severity="error", timeout=8)
 
     @work(thread=True, exclusive=True)
     def export_worker(self, apk: Path, song: str, selected: list[str], output: Path,
-                      info: SongInfo, per_diff: dict[str, DifficultyInfo]) -> None:
+                      info: SongInfo, per_diff: dict[str, DifficultyInfo], make_zip: bool = False) -> None:
+        warnings = []
+
+        def report_warning(message: str) -> None:
+            warnings.append(message)
+            self.call_from_thread(self._export_warning, message)
+
         try:
             with zipfile.ZipFile(apk) as archive:
                 paths = extract_difficulties(
                     archive, song, self.songs[song], selected, output, self.cli, info, per_diff,
-                    progress=lambda message: self.call_from_thread(self._log, message))
-            self.call_from_thread(self._finish, f"成功: {len(paths)} 个难度，输出到 {paths[0].parent}", False)
+                    progress=lambda message: self.call_from_thread(self._log, message),
+                    warning=report_warning, make_zip=make_zip)
+            detail = f"；{len(warnings)} 条警告（见日志）" if warnings else ""
+            detail += "；ZIP 已生成" if make_zip else ""
+            self.call_from_thread(self._finish,
+                                  f"成功: {len(paths)} 个难度，输出到 {paths[0].parent}{detail}",
+                                  False, bool(warnings))
         except Exception as exc:
             self.call_from_thread(self._finish, f"导出失败: {exc}", True)
 
-    def _finish(self, message: str, error: bool) -> None:
+    def _export_warning(self, message: str) -> None:
+        self._log(f"警告: {message}")
+        self.notify(message, severity="warning", timeout=10)
+
+    def _finish(self, message: str, error: bool, warned: bool = False) -> None:
         self.exporting = False
         self.query_one("#export", Button).disabled = False
         self.query_one("#load", Button).disabled = False
         self._log(message)
-        self.notify(message, severity="error" if error else "information", timeout=10)
+        self.notify(message, severity="error" if error else "warning" if warned else "information", timeout=10)
 
 
 def display_path(value: Path) -> str:
@@ -315,8 +333,9 @@ def main() -> None:
     parser.add_argument("-o", "--output", type=Path, default=Path.cwd() / "extracted",
                         help="输出目录（默认 ./extracted/）")
     parser.add_argument("--asmc", type=Path, default=default_cli(), help="AssetStudioModCLI.exe 路径")
+    parser.add_argument("--zip", dest="make_zip", action="store_true", help="初始勾选自动 ZIP（界面可取消）")
     args = parser.parse_args()
-    SongTUI(args.apk, args.output, args.asmc.resolve()).run()
+    SongTUI(args.apk, args.output, args.asmc.resolve(), args.make_zip).run()
 
 
 if __name__ == "__main__":
