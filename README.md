@@ -46,10 +46,6 @@ python extract_songs.py com.phi40.apk --meta                # 输出到终端
 ## 实现要点
 
 - 从 APK 的 `assets/aa/catalog.json` 解析：`m_EntryDataString` → dependencyKey → bucket → bundle 条目 → `m_InternalIds` 得到真实文件名（旧包回退到旧式 key 命名）。
-- 只把需要的 bundle 从 APK 流式复制到临时目录。
-- 先在临时目录完成导出并校验谱面，缺少可选音频/曲绘时警告降级；目录/ZIP 准备完毕后再提交，ZIP 用排他方式发布以防覆盖。真正的转换失败返回非零退出码和具体错误。
-
-### 谱面数据来源：
-
-- 旧版本直接读取 APK 的 `assets/bin/Data/level0`。
-- 4.0.1 将场景打包进 `assets/bin/Data/data.unity3d`（UnityFS）；工具读取目录表并只解压覆盖 `level0` 的块。LZ4 解压依赖 `requirements.txt` 中的 `lz4`。
+- 把需要的 bundle 从 APK 流式复制到临时目录。
+- 旧版本谱面数据直接来自 APK 的 `assets/bin/Data/level0`。
+- 4.0.1 将场景打包进了 `assets/bin/Data/data.unity3d`（UnityFS）。工具读取目录表并解压覆盖 `level0` 的块。依赖 `requirements.txt` 中的 `lz4`。
